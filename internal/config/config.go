@@ -2,7 +2,7 @@ package config
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"os"
 )
 
 // Config is a Server config.
@@ -20,13 +20,12 @@ var Config struct {
 		NextEngineVersion string
 	}
 	URLs struct {
-		OnNewNetwork          []string
-		NetworkLocation       string
-		BackupNetworkLocation string
+		OnNewNetwork    []string
+		NetworkLocation string
 	}
 	Matches struct {
 		Games      int
-		Parameters []interface{}
+		Parameters []any
 		Threshold  float64
 	}
 	WebServer struct {
@@ -34,8 +33,8 @@ var Config struct {
 	}
 }
 
-func init() {
-	content, err := ioutil.ReadFile("serverconfig.json")
+func LoadConfig() {
+	content, err := os.ReadFile("serverconfig.json")
 	if err != nil {
 		panic(err)
 	}

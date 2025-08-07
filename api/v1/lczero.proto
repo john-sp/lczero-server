@@ -1,0 +1,257 @@
+syntax = "proto3";
+
+option go_package = "github.com/leelachesszero/lczero-server/api/v1/lczero";
+package lczero.api.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// ============================================================================
+// Core Services
+// ============================================================================
+
+// AuthService handles authentication and token management.
+service AuthService {
+  // Converts legacy username/password credentials to a new token.
+  rpc MigrateCredentials(MigrateCredentialsRequest) returns (AuthResponse);
+
+  // Requests a token for an anonymous user.
+  rpc GetAnonymousToken(AnonymousTokenRequest) returns (AuthResponse);
+}
+
+// TaskService manages task assignment and status monitoring.
+service TaskService {
+  // Fetches the next available task for a client.
+  rpc GetNextTask(TaskRequest) returns (TaskResponse);
+
+  // Reports progress on the current task (heartbeat) and gets status.
+  rpc ReportProgress(ProgressReport) returns (ProgressResponse);
+}
+
+// ============================================================================
+// Common Message Types
+// ============================================================================
+
+enum TaskType {
+  TASK_TYPE_UNSPECIFIED = 0;
+  TRAINING = 1;
+  MATCH = 2;
+  SPRT = 3;
+  TUNING = 4;
+}
+
+message ClientInfo {
+  string version = 1;           // Client version (e.g., "v2.1.0")
+  string hostname = 2;          // Client's hostname
+  string gpu_type = 3;          // GPU description (e.g., "NVIDIA GeForce RTX 4090")
+  int32 gpu_id = 4;             // GPU device ID
+  repeated TaskType supported_task_types = 5; // List of supported task types
+}
+
+enum ResourceType {
+  RESOURCE_TYPE_UNSPECIFIED = 0;
+  NETWORK = 1;
+  BOOK = 2;
+}
+
+message ResourceSpec {
+  string sha256 = 1;            // SHA256 hash of the uncompressed file
+  string url = 2;               // Primary download URL
+  int64 size_bytes = 3;         // Total file size for progress tracking
+  ResourceType type = 4;        // Type of the resource
+  string format = 5;            // Optional: format of the resource (e.g., "pgn", "epd" for books)
+}
+
+message EngineParams {
+  repeated string args = 1;     // Command-line arguments for the lc0 engine
+  map<string, string> uci_options = 2; // Key-value pairs for UCI options
+}
+
+message BuildSpec {
+  string repo_url = 1;          // Git repository URL
+  string commit_hash = 2;       // Specific commit hash to check out
+  map<string, string> build_params = 3; // Key-value pairs for build script
+}
+
+message TimeControl {
+  message TimeBased {
+    float base_time_seconds = 1;
+    float increment_seconds = 2;
+  }
+
+  oneof control {
+    TimeBased time_based = 1; // Time-based control
+    int64 nodes_per_move = 2;   // Fixed number of nodes to search per move
+  }
+}
+
+// ============================================================================
+// Task Definitions
+// ============================================================================
+
+message TaskResponse {
+  string task_id = 1;           // Unique identifier for this task
+  oneof task {
+    TrainingTask training = 2;
+    MatchTask match = 3;
+    SprtTask sprt = 4;
+    TuningTask tuning = 5;
+  }
+}
+
+message EngineConfiguration {
+  BuildSpec build = 1;         // Engine build specification
+  ResourceSpec network = 2;      // Network for the engine
+  EngineParams params = 3;      // Engine parameters
+}
+
+message TrainingTask {
+  EngineConfiguration engine = 1; // Engine and parameters for self-play
+  ResourceSpec opening_book = 2;    // Optional opening book
+}
+
+message MatchTask {
+  EngineConfiguration baseline = 1;     // Baseline engine
+  EngineConfiguration candidate = 2;    // Candidate engine
+  ResourceSpec opening_book = 3;    // Optional opening book
+}
+
+message SprtTask {
+  EngineConfiguration baseline = 1;        // Baseline engine configuration
+  EngineConfiguration candidate = 2;       // Candidate engine configuration
+  ResourceSpec opening_book = 3;    // Opening book for games
+  TimeControl time_control = 4; // Game time control
+}
+
+message TuningTask {
+  BuildSpec build = 1;         // Engine build specification
+  ResourceSpec network = 2;      // Network to use for all games
+  ResourceSpec opening_book = 3;    // Optional opening book
+  repeated ParamSet param_sets = 4; // A list of parameter sets to test
+  TimeControl time_control = 5; // Game time control
+  int32 games_per_param_set = 6; // Number of games to play for each parameter set
+}
+
+message ParamSet {
+  string param_set_id = 1;      // Unique ID for this parameter configuration
+  EngineParams params = 2;      // The engine parameters to test
+}
+
+// ============================================================================
+// Authentication Messages
+// ============================================================================
+
+message MigrateCredentialsRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message AnonymousTokenRequest {
+  // No fields needed for this request.
+}
+
+message AuthResponse {
+  string token = 1;             // The authentication token
+}
+
+// ============================================================================
+// Task and Result Messages
+// ============================================================================
+
+message TaskRequest {
+  string token = 1;
+  ClientInfo client_info = 2;
+}
+
+message ProgressReport {
+  string token = 1;
+  string task_id = 2;
+  oneof progress {
+    TrainingProgress training = 3;
+    MatchProgress match = 4;
+    SprtProgress sprt = 5;
+    TuningProgress tuning = 6;
+  }
+  repeated CrashReport crash_reports = 7;
+}
+
+message ProgressResponse {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    ACTIVE = 1;     // The task is active and the client should continue working.
+    CANCELLED = 2;  // The task has been cancelled; the client should stop.
+  }
+  Status status = 1;
+}
+
+message GameData {
+  bytes training_data_frame = 1;
+  bytes compressed_pgn = 2;
+}
+
+message CrashReport {
+  enum CrashType {
+    CRASH_TYPE_UNSPECIFIED = 0;
+    SIGSEGV = 1;
+    INVALID_MOVE = 2;
+    TIMEOUT = 3;
+  }
+  CrashType type = 1;
+  string machine_info = 2; // Minimal, privacy-friendly machine info
+  map<string, bytes> logs = 3; // e.g., "stdout", "stderr", "engine_log"
+}
+
+message TrainingProgress {
+  repeated GameData games = 1;
+}
+
+enum ShortOutcome {
+  SHORT_OUTCOME_UNSPECIFIED = 0;
+  WHITE_WIN = 1;
+  BLACK_WIN = 2;
+  DRAW = 3;
+}
+
+enum DetailedOutcome {
+  DETAILED_OUTCOME_UNSPECIFIED = 0;
+  STALEMATE = 1;
+  CHECKMATE = 2;
+  ADJUDICATION = 3;
+  TIMEOUT = 4;
+  RESIGNATION = 5;
+}
+
+message MatchGame {
+  string pgn = 1;
+  ShortOutcome short_outcome = 2;
+  DetailedOutcome detailed_outcome = 3;
+  bool candidate_is_white = 4;
+}
+
+message MatchProgress {
+  repeated MatchGame games = 1;
+}
+
+message SprtPairReport {
+  MatchGame game1 = 1;
+  optional MatchGame game2 = 2; // The second game might not run if the first crashes
+}
+
+message SprtProgress {
+  repeated SprtPairReport pairs = 1;
+  double current_llr = 2;       // Current Log-Likelihood Ratio
+}
+
+message TuningPairResult {
+  MatchGame game1 = 1;
+  optional MatchGame game2 = 2;
+}
+
+message TuningParamSetResult {
+  string param_set_id = 1;
+  repeated TuningPairResult pairs = 2;
+}
+
+message TuningProgress {
+  repeated TuningParamSetResult results = 1;
+}
