@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -15,6 +17,8 @@ import (
 	"gorm.io/gorm"
 )
 
+// Lots of this code will to be updated to work with dev.lczero.org's for token system.
+
 // AuthServiceServer defines the server interface for AuthService.
 // This mirrors the gRPC-generated interface and allows us to start structuring the code
 // before wiring protoc generation.
@@ -27,6 +31,35 @@ type AuthServiceServer interface {
 type AuthServiceImpl struct {
 	pb.UnimplementedAuthServiceServer
 	DB *gorm.DB
+}
+
+// generateUniqueToken generates a unique token with the prefix "lc0-" and 64 random characters.
+// It checks the DB to ensure the token does not already exist.
+func generateUniqueToken(db *gorm.DB) (string, error) {
+	const (
+		prefix      = "lc0-"
+		tokenLen    = 64
+		maxAttempts = 10
+	)
+
+	for range maxAttempts {
+		raw := make([]byte, tokenLen/2) // 32 bytes = 64 hex chars
+		_, err := rand.Read(raw)
+		if err != nil {
+			return "", err
+		}
+		token := prefix + hex.EncodeToString(raw)
+
+		var count int64
+		err = db.Model(&model.AuthToken{}).Where("token = ?", token).Count(&count).Error
+		if err != nil {
+			return "", err
+		}
+		if count == 0 {
+			return token, nil
+		}
+	}
+	return "", errors.New("could not generate unique token after several attempts")
 }
 
 // NewAuthService creates a new AuthServiceImpl.
@@ -61,10 +94,12 @@ func (s *AuthServiceImpl) MigrateCredentials(ctx context.Context, req *pb.Migrat
 		return nil, status.Error(codes.Internal, "Database error")
 	}
 
-	// TODO: fill implementation to issue token
-	_ = req
+	tokenStr, err := generateUniqueToken(s.DB)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "Failed to generate token")
+	}
 	token := &model.AuthToken{
-		Token:        "TODO-generate",
+		Token:        tokenStr,
 		IssuedReason: model.TokenReasonMigrated,
 	}
 	now := time.Now()
@@ -77,10 +112,12 @@ func (s *AuthServiceImpl) MigrateCredentials(ctx context.Context, req *pb.Migrat
 
 // GetAnonymousToken issues an anonymous token without a user.
 func (s *AuthServiceImpl) GetAnonymousToken(ctx context.Context, req *pb.AnonymousTokenRequest) (*pb.AuthResponse, error) {
-	// TODO: fill implementation (create token with null user, expiry policy)
-	_ = req
+	tokenStr, err := generateUniqueToken(s.DB)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "Failed to generate token")
+	}
 	token := &model.AuthToken{
-		Token:        "TODO-generate",
+		Token:        tokenStr,
 		IssuedReason: model.TokenReasonAnonymous,
 	}
 	now := time.Now()
