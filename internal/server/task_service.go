@@ -11,6 +11,29 @@ import (
 	"gorm.io/gorm"
 )
 
+// validateToken checks if the provided token string exists and is active in the database.
+func (s *TaskServiceImpl) validateToken(token string) (*models.AuthToken, error) {
+	if len(token) < 5 || token[:4] != "lc0-" {
+		return nil, ErrInvalidTokenFormat
+	}
+	var tok models.AuthToken
+	if err := s.DB.Where("token = ? AND active = ?", token, true).First(&tok).Error; err != nil {
+		return nil, err
+	}
+
+	// If the token is found, update its last used timestamp
+	now := time.Now()
+	tok.LastUsedAt = &now
+	if err := s.DB.Save(&tok).Error; err != nil {
+		return nil, err
+	}
+
+	return &tok, nil
+}
+
+// ErrInvalidTokenFormat is returned when a token does not start with "lc0-".
+var ErrInvalidTokenFormat = gorm.ErrInvalidTransaction // Use a recognizable error, or define your own
+
 // TaskServiceServer defines the server interface for TaskService.
 type TaskServiceServer interface {
 	GetNextTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResponse, error)
@@ -23,29 +46,42 @@ type TaskServiceImpl struct {
 	DB *gorm.DB
 }
 
+// updateClientInfo updates audit fields for the given token using client info from the request.
+func (s *TaskServiceImpl) updateClientInfo(tok *models.AuthToken, clientInfo *pb.ClientInfo) {
+	now := time.Now()
+	_ = s.DB.Model(tok).Updates(map[string]interface{}{
+		"last_used_at":   &now,
+		"client_host":    clientInfo.GetHostname(),
+		"client_version": clientInfo.GetVersion(),
+		"gpu_type":       clientInfo.GetGpuType(),
+		"gpuid":          func() *int32 { v := clientInfo.GetGpuId(); return &v }(),
+	}).Error
+}
+
 // NewTaskService constructs the TaskServiceImpl.
 func NewTaskService(dbConn *gorm.DB) *TaskServiceImpl {
 	return &TaskServiceImpl{DB: dbConn}
 }
 
-// GetNextTask fetches next available task for the client/token.
+/*
+GetNextTask fetches next available task for the client/token
+
+TODO for this function:
+1. Validate engine version for each task
+2. Handle task assignment logic (Other Task types)
+3. Size, SHA, and URL for all resources
+4. Task ID generation
+5. Correctly handle engine parameters
+6.
+*/
 func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResponse, error) {
 	// 1) Validate token and update audit info
-	var tok models.AuthToken
-	if err := s.DB.Where("token = ?", req.Token).First(&tok).Error; err != nil {
+	tok, err := s.validateToken(req.Token)
+	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
-	if err := s.DB.Model(&tok).Updates(map[string]interface{}{
-		"last_used_at":   &now,
-		"client_host":    req.GetClientInfo().GetHostname(),
-		"client_version": req.GetClientInfo().GetVersion(),
-		"gpu_type":       req.GetClientInfo().GetGpuType(),
-		"gpuid":          func() *int32 { v := req.GetClientInfo().GetGpuId(); return &v }(),
-	}).Error; err != nil {
-		// If schema doesn't include these columns yet, ignore errors for optional fields
-		_ = err
-	}
+	s.updateClientInfo(tok, req.GetClientInfo())
 
 	// 2) Choose the lowest-id active TrainingRun (do NOT default to zero)
 	var tr models.TrainingRun
@@ -59,9 +95,7 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 		return nil, err
 	}
 
-	// Attempt MATCH assignment first, mirroring legacy nextGame behavior.
-	// Compute a deterministic slice key from token string when possible.
-	// Fallback to 1..3 slices cycling.
+	// Compute deterministic slice for match assignment
 	tokenStr := req.GetToken()
 	slice := 1
 	if len(tokenStr) > 0 {
@@ -71,7 +105,26 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 		}
 		slice = (acc%3 + 1)
 	}
-	// Find next pending match for this training run and slice.
+
+	// Try match task first
+	resp, err := s.getNextMatchTask(ctx, tok, tr, now, req, slice)
+	if err == nil && resp != nil {
+		return resp, nil
+	}
+
+	// Fallback to training task
+	return s.getNextTrainingTask(ctx, tok, tr, net, now, req)
+}
+
+// getNextMatchTask tries to allocate a match task for the given training run and slice.
+func (s *TaskServiceImpl) getNextMatchTask(
+	ctx context.Context,
+	tok *models.AuthToken,
+	tr models.TrainingRun,
+	now time.Time,
+	req *pb.TaskRequest,
+	slice int,
+) (*pb.TaskResponse, error) {
 	var pendingMatch models.Match
 	matchQuery := s.DB.
 		Preload("Candidate").
@@ -79,7 +132,6 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 		Where("done = ? AND training_run_id = ? AND (target_slice = 0 OR target_slice = ?)", false, tr.ID, slice).
 		Order("id ASC")
 	if err := matchQuery.First(&pendingMatch).Error; err == nil {
-		// Allocate a MatchGame row to track assignment-like behavior as legacy server did.
 		mg := &models.MatchGame{
 			UserID: func() uint {
 				if tok.UserID != nil {
@@ -94,12 +146,8 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 			return nil, err
 		}
 		flip := (mg.ID & 1) == 1
-		if err := s.DB.Model(mg).Update("flip", flip).Error; err != nil {
-			// Non-fatal; continue even if flip update fails
-			_ = err
-		}
+		_ = s.DB.Model(mg).Update("flip", flip).Error
 
-		// Build Match task response payload.
 		baselineNetRes := &pb.ResourceSpec{
 			Sha256:    pendingMatch.CurrentBest.Sha,
 			Url:       "",
@@ -139,7 +187,6 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 			OpeningBook: matchBook,
 		}
 
-		// Generate task id and persist GrpcTask
 		taskID := time.Now().UTC().Format("20060102T150405.000000000")
 		grpcTask := &models.GrpcTask{
 			TaskID:      taskID,
@@ -168,48 +215,48 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 		}
 		return resp, nil
 	}
+	return nil, nil
+}
 
-	// No match available; fall back to training task.
-	// Build proto resources per api/v1/lczero.proto
+// getNextTrainingTask allocates a training task for the given training run.
+func (s *TaskServiceImpl) getNextTrainingTask(
+	ctx context.Context,
+	tok *models.AuthToken,
+	tr models.TrainingRun,
+	net models.Network,
+	now time.Time,
+	req *pb.TaskRequest,
+) (*pb.TaskResponse, error) {
 	networkRes := &pb.ResourceSpec{
 		Sha256:    net.Sha,
-		Url:       "", // Optional: fill with CDN/path when available
-		SizeBytes: 0,  // Unknown size currently
+		Url:       "",
+		SizeBytes: 0,
 		Type:      pb.ResourceType_NETWORK,
-		Format:    "", // Unknown, not required
+		Format:    "",
 	}
 	openingBookRes := &pb.ResourceSpec{
-		Sha256:    "", // Unknown; provide URL only if configured
+		Sha256:    "",
 		Url:       tr.TrainBook,
-		SizeBytes: 0, // Unknown size currently
+		SizeBytes: 0,
 		Type:      pb.ResourceType_BOOK,
 		Format:    "pgn",
 	}
-
-	// Engine build and params placeholders (can be extended later)
 	engineCfg := &pb.EngineConfiguration{
-		Build:   &pb.BuildSpec{}, // No specific repo/commit for now
+		Build:   &pb.BuildSpec{},
 		Network: networkRes,
 		Params: &pb.EngineParams{
 			Args:       []string{tr.TrainParameters},
 			UciOptions: map[string]string{},
 		},
 	}
-
-	// Compose TrainingTask
 	trainingTask := &pb.TrainingTask{
 		Engine:      engineCfg,
 		OpeningBook: openingBookRes,
 	}
-
-	// Generate a stable external task id; placeholder for now
 	taskID := time.Now().UTC().Format("20060102T150405.000000000")
-
-	// Persist GrpcTask record
 	grpcTask := &models.GrpcTask{
-		TaskID:   taskID,
-		TaskType: models.TaskTypeTraining,
-		// Optionally serialize payload; left empty until a serializer is decided
+		TaskID:      taskID,
+		TaskType:    models.TaskTypeTraining,
 		PayloadJSON: "",
 		AssignedTokenID: func() *uint {
 			if tok.ID == 0 {
@@ -225,8 +272,6 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 	if err := s.DB.Create(grpcTask).Error; err != nil {
 		return nil, err
 	}
-
-	// Wrap into TaskResponse per proto
 	resp := &pb.TaskResponse{
 		TaskId: taskID,
 		Task: &pb.TaskResponse_Training{
@@ -236,9 +281,27 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 	return resp, nil
 }
 
-// ReportProgress updates heartbeat and checks cancellation. TODO: Does not save games that are uploaded
-// Find a way to remove tasks that are never completed, missing a number of heart beats
+/*
+ReportProgress updates heartbeat and checks cancellation.
+
+TODO for this function:
+1. Handle training and match cases
+2. Save games that are uploaded
+  - Verify versions before save
+
+3. Handle SPRT and tuning progress
+4. Correctly update task status based on progress
+5. Remove tasks that are never completed, missing a number of heart beats
+6. Handle cancellation logic
+7. Handle crashes and logging
+*/
 func (s *TaskServiceImpl) ReportProgress(ctx context.Context, req *pb.ProgressReport) (*pb.ProgressResponse, error) {
+
+	_, err := s.validateToken(req.Token)
+	if err != nil {
+		return nil, err
+	}
+
 	var task models.GrpcTask
 	if err := s.DB.Where("task_id = ?", req.TaskId).First(&task).Error; err != nil {
 		return nil, err
