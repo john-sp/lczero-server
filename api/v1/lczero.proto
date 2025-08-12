@@ -108,12 +108,15 @@ message EngineConfiguration {
 message TrainingTask {
   EngineConfiguration engine = 1; // Engine and parameters for self-play
   ResourceSpec opening_book = 2;    // Optional opening book
+  int64 nodes_per_move = 3; // Nodes per move for training
 }
 
 message MatchTask {
   EngineConfiguration baseline = 1;     // Baseline engine
   EngineConfiguration candidate = 2;    // Candidate engine
   ResourceSpec opening_book = 3;    // Optional opening book
+  int64 nodes_per_move = 4; // Nodes per move for matches
+
 }
 
 message SprtTask {
