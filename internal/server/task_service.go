@@ -2,13 +2,16 @@ package server
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	pb "github.com/leelachesszero/lczero-server/api/v1"
 
 	"github.com/leelachesszero/lczero-server/internal/models"
 
-	"gorm.io/gorm"
+	"database/sql"
+
+	"github.com/leelachesszero/lczero-server/internal/db/queries"
 )
 
 // validateToken checks if the provided token string exists and is active in the database.
@@ -17,14 +20,20 @@ func (s *TaskServiceImpl) validateToken(token string) (*models.AuthToken, error)
 		return nil, ErrInvalidTokenFormat
 	}
 	var tok models.AuthToken
-	if err := s.DB.Where("token = ? AND active = ?", token, true).First(&tok).Error; err != nil {
+	row := s.DB.QueryRow(`SELECT id, created_at, updated_at, user_id, token, last_used_at, issued_reason, client_version, client_host, gpu_type, gpuid, status FROM auth_tokens WHERE token = $1`, token)
+	err := row.Scan(
+		&tok.ID, &tok.CreatedAt, &tok.UpdatedAt, &tok.UserID, &tok.Token, &tok.LastUsedAt, &tok.IssuedReason,
+		&tok.ClientVersion, &tok.ClientHost, &tok.GPUType, &tok.GPUID,
+	)
+	if err != nil {
 		return nil, err
 	}
 
 	// If the token is found, update its last used timestamp
 	now := time.Now()
 	tok.LastUsedAt = &now
-	if err := s.DB.Save(&tok).Error; err != nil {
+	_, err = s.DB.Exec(`UPDATE auth_tokens SET last_used_at = $1 WHERE id = $2`, now, tok.ID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -32,7 +41,7 @@ func (s *TaskServiceImpl) validateToken(token string) (*models.AuthToken, error)
 }
 
 // ErrInvalidTokenFormat is returned when a token does not start with "lc0-".
-var ErrInvalidTokenFormat = gorm.ErrInvalidTransaction // Use a recognizable error, or define your own
+var ErrInvalidTokenFormat = errors.New("invalid token format")
 
 // TaskServiceServer defines the server interface for TaskService.
 type TaskServiceServer interface {
@@ -43,23 +52,25 @@ type TaskServiceServer interface {
 // TaskServiceImpl provides TaskService backed by DB.
 type TaskServiceImpl struct {
 	pb.UnimplementedTaskServiceServer
-	DB *gorm.DB
+	DB *sql.DB
 }
 
 // updateClientInfo updates audit fields for the given token using client info from the request.
 func (s *TaskServiceImpl) updateClientInfo(tok *models.AuthToken, clientInfo *pb.ClientInfo) {
 	now := time.Now()
-	_ = s.DB.Model(tok).Updates(map[string]interface{}{
-		"last_used_at":   &now,
-		"client_host":    clientInfo.GetHostname(),
-		"client_version": clientInfo.GetVersion(),
-		"gpu_type":       clientInfo.GetGpuType(),
-		"gpuid":          func() *int32 { v := clientInfo.GetGpuId(); return &v }(),
-	}).Error
+	_, _ = s.DB.Exec(
+		`UPDATE auth_tokens SET last_used_at = $1, client_host = $2, client_version = $3, gpu_type = $4, gpuid = $5 WHERE id = $6`,
+		now,
+		clientInfo.GetHostname(),
+		clientInfo.GetVersion(),
+		clientInfo.GetGpuType(),
+		clientInfo.GetGpuId(),
+		tok.ID,
+	)
 }
 
 // NewTaskService constructs the TaskServiceImpl.
-func NewTaskService(dbConn *gorm.DB) *TaskServiceImpl {
+func NewTaskService(dbConn *sql.DB) *TaskServiceImpl {
 	return &TaskServiceImpl{DB: dbConn}
 }
 
@@ -84,14 +95,14 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 	s.updateClientInfo(tok, req.GetClientInfo())
 
 	// 2) Choose the lowest-id active TrainingRun (do NOT default to zero)
-	var tr models.TrainingRun
-	if err := s.DB.Where("active = ?", true).Order("id ASC").First(&tr).Error; err != nil {
+	tr, err := queries.FetchActiveTrainingTask(s.DB)
+	if err != nil {
 		return nil, err
 	}
 
 	// Load best network for this run
-	var net models.Network
-	if err := s.DB.Where("id = ?", tr.BestNetworkID).First(&net).Error; err != nil {
+	net, err := queries.FetchNetworkByID(s.DB, tr.BestNetworkID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -107,31 +118,30 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 	}
 
 	// Try match task first
-	resp, err := s.getNextMatchTask(ctx, tok, tr, now, req, slice)
+	resp, err := s.getNextMatchTask(ctx, tok, *tr, now, req, slice)
 	if err == nil && resp != nil {
 		return resp, nil
 	}
 
 	// Fallback to training task
-	return s.getNextTrainingTask(ctx, tok, tr, net, now, req)
+	return s.getNextTrainingTask(ctx, tok, *tr, *net, now, req)
 }
 
 // getNextMatchTask tries to allocate a match task for the given training run and slice.
 func (s *TaskServiceImpl) getNextMatchTask(
 	ctx context.Context,
 	tok *models.AuthToken,
-	tr models.TrainingRun,
+	tr models.TrainingTask,
 	now time.Time,
 	req *pb.TaskRequest,
 	slice int,
 ) (*pb.TaskResponse, error) {
-	var pendingMatch models.Match
-	matchQuery := s.DB.
-		Preload("Candidate").
-		Preload("CurrentBest").
-		Where("done = ? AND training_run_id = ? AND (target_slice = 0 OR target_slice = ?)", false, tr.ID, slice).
-		Order("id ASC")
-	if err := matchQuery.First(&pendingMatch).Error; err == nil {
+	// TODO: I think this is wrong, look over again. It is almost an exact copy from the HTTP version.
+
+	// NOTE: target slice no longer exists in MatchTask. Rework required
+	pendingMatchPtr, err := queries.FetchPendingMatch(s.DB, tr.ID, slice)
+	if err == nil && pendingMatchPtr != nil {
+		pendingMatch := *pendingMatchPtr
 		mg := &models.MatchGame{
 			UserID: func() uint {
 				if tok.UserID != nil {
@@ -142,30 +152,37 @@ func (s *TaskServiceImpl) getNextMatchTask(
 			MatchID: pendingMatch.ID,
 			Done:    false,
 		}
-		if err := s.DB.Create(mg).Error; err != nil {
+		mg.ID, err = queries.InsertMatchGame(s.DB, mg.UserID, mg.MatchID, mg.Done)
+		if err != nil {
 			return nil, err
 		}
 		flip := (mg.ID & 1) == 1
-		_ = s.DB.Model(mg).Update("flip", flip).Error
+		_ = queries.UpdateMatchGameFlip(s.DB, mg.ID, flip)
+
+		// Fetch Candidate and CurrentBest networks for resource specs
+		candidateSha, _ := queries.FetchNetworkSha(s.DB, pendingMatch.CandidateID)
+		currentBestSha, _ := queries.FetchNetworkSha(s.DB, pendingMatch.CurrentBestID)
 
 		baselineNetRes := &pb.ResourceSpec{
-			Sha256:    pendingMatch.CurrentBest.Sha,
+			Sha256:    currentBestSha,
 			Url:       "",
 			SizeBytes: 0,
 			Type:      pb.ResourceType_NETWORK,
 			Format:    "",
 		}
 		candidateNetRes := &pb.ResourceSpec{
-			Sha256:    pendingMatch.Candidate.Sha,
+			Sha256:    candidateSha,
 			Url:       "",
 			SizeBytes: 0,
 			Type:      pb.ResourceType_NETWORK,
 			Format:    "",
 		}
+		// Fetch MatchBook info
+		matchBookSha, matchBookURL, matchBookSize, _ := queries.FetchBookByID(s.DB, tr.MatchBookID)
 		matchBook := &pb.ResourceSpec{
-			Sha256:    "",
-			Url:       tr.MatchBook,
-			SizeBytes: 0,
+			Sha256:    matchBookSha,
+			Url:       matchBookURL,
+			SizeBytes: matchBookSize,
 			Type:      pb.ResourceType_BOOK,
 			Format:    "pgn",
 		}
@@ -188,22 +205,16 @@ func (s *TaskServiceImpl) getNextMatchTask(
 		}
 
 		taskID := time.Now().UTC().Format("20060102T150405.000000000")
-		grpcTask := &models.GrpcTask{
-			TaskID:      taskID,
-			TaskType:    models.TaskTypeMatch,
-			PayloadJSON: "",
-			AssignedTokenID: func() *uint {
-				if tok.ID == 0 {
-					return nil
-				}
-				v := tok.ID
-				return &v
-			}(),
-			AssignedAt:      &now,
-			LastHeartbeatAt: &now,
-			Status:          models.TaskStatusActive,
-		}
-		if err := s.DB.Create(grpcTask).Error; err != nil {
+		grpcTaskID, err := queries.InsertTaskAssignment(
+			s.DB,
+			taskID,
+			models.TaskTypeMatch,
+			tok.ID,
+			now,
+			now,
+			models.TaskStatusActive,
+		)
+		if err != nil {
 			return nil, err
 		}
 
@@ -213,6 +224,7 @@ func (s *TaskServiceImpl) getNextMatchTask(
 				Match: matchTask,
 			},
 		}
+		_ = grpcTaskID // suppress unused warning
 		return resp, nil
 	}
 	return nil, nil
@@ -222,7 +234,7 @@ func (s *TaskServiceImpl) getNextMatchTask(
 func (s *TaskServiceImpl) getNextTrainingTask(
 	ctx context.Context,
 	tok *models.AuthToken,
-	tr models.TrainingRun,
+	tr models.TrainingTask,
 	net models.Network,
 	now time.Time,
 	req *pb.TaskRequest,
@@ -235,9 +247,9 @@ func (s *TaskServiceImpl) getNextTrainingTask(
 		Format:    "",
 	}
 	openingBookRes := &pb.ResourceSpec{
-		Sha256:    "",
-		Url:       tr.TrainBook,
-		SizeBytes: 0,
+		Sha256:    tr.TrainBook.Sha256,
+		Url:       tr.TrainBook.URL,
+		SizeBytes: tr.TrainBook.SizeBytes,
 		Type:      pb.ResourceType_BOOK,
 		Format:    "pgn",
 	}
@@ -250,28 +262,24 @@ func (s *TaskServiceImpl) getNextTrainingTask(
 		},
 	}
 	trainingTask := &pb.TrainingTask{
-		Engine:      engineCfg,
-		OpeningBook: openingBookRes,
+		Engine:       engineCfg,
+		OpeningBook:  openingBookRes,
+		NodesPerMove: 8000, // TODO: Get from table
 	}
 	taskID := time.Now().UTC().Format("20060102T150405.000000000")
-	grpcTask := &models.GrpcTask{
-		TaskID:      taskID,
-		TaskType:    models.TaskTypeTraining,
-		PayloadJSON: "",
-		AssignedTokenID: func() *uint {
-			if tok.ID == 0 {
-				return nil
-			}
-			v := tok.ID
-			return &v
-		}(),
-		AssignedAt:      &now,
-		LastHeartbeatAt: &now,
-		Status:          models.TaskStatusActive,
-	}
-	if err := s.DB.Create(grpcTask).Error; err != nil {
+	grpcTaskID, err := queries.InsertTaskAssignment(
+		s.DB,
+		taskID,
+		models.TaskTypeTraining,
+		tok.ID,
+		now,
+		now,
+		models.TaskStatusActive,
+	)
+	if err != nil {
 		return nil, err
 	}
+	_ = grpcTaskID // suppress unused warning
 	resp := &pb.TaskResponse{
 		TaskId: taskID,
 		Task: &pb.TaskResponse_Training{
@@ -302,8 +310,12 @@ func (s *TaskServiceImpl) ReportProgress(ctx context.Context, req *pb.ProgressRe
 		return nil, err
 	}
 
-	var task models.GrpcTask
-	if err := s.DB.Where("task_id = ?", req.TaskId).First(&task).Error; err != nil {
+	var task models.TaskAssignment
+	rowTask := s.DB.QueryRow(`SELECT id, created_at, updated_at, task_id, task_type, assigned_token_id, assigned_at, last_heartbeat_at, status, cancelled_at, completed_at FROM task_assignments WHERE task_id = $1`, req.TaskId)
+	err = rowTask.Scan(
+		&task.ID, &task.CreatedAt, &task.UpdatedAt, &task.TaskID, &task.TaskType, &task.AssignedTokenID, &task.AssignedAt, &task.LastHeartbeatAt, &task.Status, &task.CancelledAt, &task.CompletedAt,
+	)
+	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
@@ -320,7 +332,8 @@ func (s *TaskServiceImpl) ReportProgress(ctx context.Context, req *pb.ProgressRe
 		// TODO: Handle tuning progress
 	}
 
-	if err := s.DB.Save(&task).Error; err != nil {
+	err = queries.UpdateTaskAssignmentHeartbeat(s.DB, task.ID, now)
+	if err != nil {
 		return nil, err
 	}
 

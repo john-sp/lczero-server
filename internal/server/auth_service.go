@@ -14,7 +14,9 @@ import (
 
 	model "github.com/leelachesszero/lczero-server/internal/models"
 
-	"gorm.io/gorm"
+	"database/sql"
+
+	"github.com/leelachesszero/lczero-server/internal/db/queries"
 )
 
 // Lots of this code will to be updated to work with dev.lczero.org's for token system.
@@ -30,19 +32,19 @@ type AuthServiceServer interface {
 // AuthServiceImpl is the concrete implementation backed by Gorm and our models.
 type AuthServiceImpl struct {
 	pb.UnimplementedAuthServiceServer
-	DB *gorm.DB
+	DB *sql.DB
 }
 
 // generateUniqueToken generates a unique token with the prefix "lc0-" and 64 random characters.
 // It checks the DB to ensure the token does not already exist.
-func generateUniqueToken(db *gorm.DB) (string, error) {
+func generateUniqueToken(db *sql.DB) (string, error) {
 	const (
 		prefix      = "lc0-"
 		tokenLen    = 64
 		maxAttempts = 10
 	)
 
-	for range maxAttempts {
+	for i := 0; i < maxAttempts; i++ {
 		raw := make([]byte, tokenLen/2) // 32 bytes = 64 hex chars
 		_, err := rand.Read(raw)
 		if err != nil {
@@ -50,8 +52,8 @@ func generateUniqueToken(db *gorm.DB) (string, error) {
 		}
 		token := prefix + hex.EncodeToString(raw)
 
-		var count int64
-		err = db.Model(&model.AuthToken{}).Where("token = ?", token).Count(&count).Error
+		var count int
+		err = db.QueryRow(`SELECT COUNT(1) FROM auth_tokens WHERE token = $1`, token).Scan(&count)
 		if err != nil {
 			return "", err
 		}
@@ -63,7 +65,7 @@ func generateUniqueToken(db *gorm.DB) (string, error) {
 }
 
 // NewAuthService creates a new AuthServiceImpl.
-func NewAuthService(dbConn *gorm.DB) *AuthServiceImpl {
+func NewAuthService(dbConn *sql.DB) *AuthServiceImpl {
 	return &AuthServiceImpl{DB: dbConn}
 }
 
@@ -86,9 +88,10 @@ func (s *AuthServiceImpl) MigrateCredentials(ctx context.Context, req *pb.Migrat
 		Username: req.Username,
 		Password: req.Password,
 	}
-	err := s.DB.Where(model.User{Username: req.Username}).First(user).Error
+	row := s.DB.QueryRow(queries.SelectUserByUsername, req.Username)
+	err := row.Scan(&user.ID, &user.Username, &user.Password, &user.AssignedTrainingRunID, &user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, status.Error(codes.NotFound, "User not found")
 		}
 		return nil, status.Error(codes.Internal, "Database error")
@@ -104,9 +107,18 @@ func (s *AuthServiceImpl) MigrateCredentials(ctx context.Context, req *pb.Migrat
 	}
 	now := time.Now()
 	token.CreatedAt = now
-	if err := s.DB.Create(token).Error; err != nil {
-		return nil, err
+	var tokenID uint
+	err = s.DB.QueryRow(
+		queries.InsertAuthToken,
+		token.Token,
+		token.IssuedReason,
+		token.CreatedAt,
+		user.ID,
+	).Scan(&tokenID)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "Failed to insert token")
 	}
+	token.ID = tokenID
 	return &pb.AuthResponse{Token: token.Token}, nil
 }
 
@@ -122,8 +134,17 @@ func (s *AuthServiceImpl) GetAnonymousToken(ctx context.Context, req *pb.Anonymo
 	}
 	now := time.Now()
 	token.CreatedAt = now
-	if err := s.DB.Create(token).Error; err != nil {
-		return nil, err
+	var tokenID uint
+	err = s.DB.QueryRow(
+		queries.InsertAuthToken,
+		token.Token,
+		token.IssuedReason,
+		token.CreatedAt,
+		nil,
+	).Scan(&tokenID)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "Failed to insert token")
 	}
+	token.ID = tokenID
 	return &pb.AuthResponse{Token: token.Token}, nil
 }
