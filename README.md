@@ -1,148 +1,63 @@
-## Setup
+AI written Readme. Update this more as needed.
 
-Install nginx as the proxy:
-```
-sudo apt-get install ufw
-sudo ufw allow ssh
-sudo ufw allow 80
-sudo ufw enable
+# LCZero gRPC Training Server
 
-sudo netstat -tupln
-# Ensure nothing active.
-sudo apt-get purge rpcbind
-sudo apt-get purge apache2 apache2-utils apache2.2-bin
+Rewrite of the LCZero training server using gRPC. It interacts with https://dev.lczero.org and removes all website components from the legacy HTTP server, adding richer tasking (training, match, SPRT, tuning).
 
-# Install nginx
-sudo apt-get install -y nginx
-sudo systemctl status nginx
+- Language: Go 1.23
+- RPC: gRPC + Protocol Buffers (see `api/v1/lczero.proto`)
+- DB: PostgreSQL (schema in `schema.sql`; human guide in `schema.md`)
+- Entry point: `cmd/main.go`
 
-cp nginx/default /etc/nginx/sites-available/default
+Our old training setup was a pain: starting a new run meant hand-editing the database, fiddling with YAML, and clobbering whatever was in "Run 0." We also had a separate [OpenBench](https://github.com/LeelaChessZero/OpenBench/) instance for [SPRT](https://www.chessprogramming.org/Match_Statistics#SPRT) and tuning hyperparameters was done individually via [Chess Tuning Tools](https://chess-tuning-tools.readthedocs.io/en/latest/) (let’s be real, it was mostly devs running this and posting results on Discord).
 
-# Create cache directory
-mkdir -p /home/web/nginx/cache/
-```
+This rewrite aims to fix all that—bringing everything (training, matches, tuning, and SPRT) into one unified, distributed system that’s actually flexible and easy to experiment with. It is taking heavy inspiration from OpenBench, just expanded to fit our need. 
 
-Installing postgres:
-```
-$ sudo apt-get install postgresql postgresql-contrib
-$ sudo -u postgres createuser --interactive
-Enter name of role to add: gorm
-Shall the new role be a superuser? (y/n) n
-Shall the new role be allowed to create databases? (y/n) y
-Shall the new role be allowed to create more new roles? (y/n) n
+## Architecture
+- Services: `AuthService` (token issuance), `TaskService` (task assignment + data collection)
+- Packages:
+	- `internal/config`: loads `serverconfig.json`
+	- `internal/db`: Postgres connection
+	- `internal/server`: gRPC services (`auth_service.go`, `task_service.go`)
+	- `internal/models`, `internal/db/queries`: model structs and SQL helpers
+	- `api/v1`: protobuf (`.proto` + generated `.pb.go`)
 
-$ sudo -u postgres createdb gorm
-$ sudo -u postgres psql
-ALTER ROLE gorm WITH PASSWORD 'gorm';
-\q
+## Prerequisites
+- Go 1.23.x
+- PostgreSQL 13+ (14+ recommended)
+- protoc (only if re-generating protobuf code)
 
-$ sudo -u postgres psql -d gorm
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO web;
-GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO web;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO web;
+## Configuration
+Copy and edit `serverconfig.json`.
 
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-   GRANT SELECT ON TABLES TO web;
-\q
-```
+Relevant fields (mapped by `internal/config/config.go`):
+- `database.host|user|dbname|password`
+- `webserver.address` (e.g., `":9830"`)
+- Client/engine version gates and URLs for artifacts
 
-Setting up materialized views:
-```
-gorm=# CREATE MATERIALIZED VIEW games_month AS SELECT user_id, username, count(*) FROM training_games
-LEFT JOIN users
-ON users.id = training_games.user_id
-WHERE training_games.created_at >= now() - INTERVAL '1 month'
-GROUP BY user_id, username
-ORDER BY count DESC;
-SELECT 1606
-gorm=# CREATE MATERIALIZED VIEW games_all AS SELECT user_id, username, count(*) FROM training_games
-LEFT JOIN users
-ON users.id = training_games.user_id
-GROUP BY user_id, username
-ORDER BY count DESC;
-SELECT 3974
+## Database setup
+Theoretically, the database should be setup from the https://dev.lczero.org/ but here is a basic setup instructions.  
+
+1) Create DB and user, then apply schema:
+
+```powershell
+# Example (adjust to your environment)
+psql -h localhost -U postgres -c "CREATE ROLE lc0 WITH LOGIN PASSWORD 'lc0pass';"
+psql -h localhost -U postgres -c "CREATE DATABASE lc0 OWNER lc0;"
+psql -h localhost -U lc0 -d lc0 -f .\schema.sql
 ```
 
-Then in crontab:
-```
-REFRESH MATERIALIZED VIEW games_month;
-REFRESH MATERIALIZED VIEW games_all;
+2) Optional: read `schema.md` for a human-friendly schema guide and improvement notes.
+
+## Regenerate protobuf (optional)
+```powershell
+# Requires protoc and the Go plugins installed
+protoc --go_out=. --go-grpc_out=. api/v1/lczero.proto
 ```
 
-### Server prereqs
+## Notes / roadmap
+- Legacy `users`/`clients` are read-only (migration only). See `schema.md`.
+- Several FKs and NOT NULLs are intentionally loose while iterating; see improvement list in `schema.md`.
+- Task assignment logic is evolving (see TODOs in `internal/server/task_service.go`).
 
-```
-go get github.com/gin-gonic/gin
-go get github.com/gin-contrib/multitemplate
-go get -u github.com/jinzhu/gorm
-go get github.com/lib/pq
-go get github.com/hashicorp/go-version
-go build main.go
-```
 
-In `~/.bashrc`:
-```
-export PATH=$PATH:/usr/lib/go-1.9/bin
-export GOPATH=~/go:~/lczero-server
-```
-
-### Run the Server
-
-```
-./prod.sh
-```
-
-### Uploading new networks
-
-```
-curl -F 'file=@weights.txt.gz' -F 'training_id=1' -F 'layers=6' -F 'filters=64' http://localhost:8080/upload_network
-```
-
-### Server maintenance
-
-Connecting through psql:
-```
-sudo -u postgres psql -d gorm
-```
-
-Restarting nginx:
-```
-sudo service nginx restart
-```
-
-Postgres online repack
-```
-sudo apt-get install postgresql-server-dev-9.5 mawk
-sudo easy_install pgxnclient
-sudo pgxn install pg_repack
-sudo -u postgres psql -c "CREATE EXTENSION pg_repack" -d gorm
-/usr/lib/postgresql/9.5/bin/pg_repack
-```
-
-Postgres performance tuning
-```
-https://github.com/jfcoz/postgresqltuner
-```
-
-### Setting up backup
-
-```
-sudo pip install awscli
-
-# Set up IAM user with permissions to upload to s3
-aws configure
-```
-
-Executing a backup:
-```
-pg_dump gorm | gzip > backup.gz
-```
-
-Restoring from a backup:
-```
-$ dropdb -U gorm gorm
-$ createdb -U gorm gorm
-$ gunzip -c backup.gz | psql gorm
-```
-
-Note that on my mac, all the postgres utilities are at `/Library/PostgreSQL/10/bin/`.
