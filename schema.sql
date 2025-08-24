@@ -193,6 +193,9 @@ CREATE TABLE sprt_tasks (
   nodes_per_move BIGINT
 );
 
+-- See https://github.com/LeelaChessZero/OpenBench/blob/master/OpenBench/models.py for better table definitions. Must decide what is needed. At minimum, the following tables should be considered:
+-- Result (Most importantly, the wins, losses, draws, games (WDL all added up, maybe dont count, compute at run time), crashes, timeouts)
+
 -- TuneTask table
 CREATE TABLE tune_tasks (
   id BIGSERIAL PRIMARY KEY,
