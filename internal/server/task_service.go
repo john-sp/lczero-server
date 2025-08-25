@@ -78,12 +78,22 @@ func NewTaskService(dbConn *sql.DB) *TaskServiceImpl {
 GetNextTask fetches next available task for the client/token
 
 TODO for this function:
-1. Validate engine version for each task
-2. Handle task assignment logic (Other Task types)
-3. Size, SHA, and URL for all resources
-4. Task ID generation
-5. Correctly handle engine parameters
-6.
+1. Determine what tasks the user is eligible for based on their token and client info
+  - Validate engine version
+  - Check user supported task types
+
+2. Determine NPS on each task type (Depends on network, might be hard. Maybe use a known network)
+  - Potentially store this NPS in a hardware db.
+
+3. Compute workload ratios (mostly for training runs)
+
+4. Assign user to previous task (if it exists), if it doesn't mess with ratios too much
+
+5. Size, SHA, and URL for all resources.
+
+6. Task ID generation
+
+7. Correctly handle engine parameters.
 */
 func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResponse, error) {
 	// 1) Validate token and update audit info
@@ -126,6 +136,8 @@ func (s *TaskServiceImpl) GetNextTask(ctx context.Context, req *pb.TaskRequest) 
 	// Fallback to training task
 	return s.getNextTrainingTask(ctx, tok, *tr, *net, now, req)
 }
+
+// TODO: getNextMatchTask and getNextTrainingTask are both almost direct copies from HTTP version. They should be rewritten.
 
 // getNextMatchTask tries to allocate a match task for the given training run and slice.
 func (s *TaskServiceImpl) getNextMatchTask(
@@ -293,6 +305,17 @@ func (s *TaskServiceImpl) getNextTrainingTask(
 ReportProgress updates heartbeat and checks cancellation.
 
 TODO for this function:
+
+## Training/Match Heartbeats
+- Save games that are uploaded
+
+## SPRT Heartbeats
+- Record Wins/Losses/Draws (Pentanomial requires LL/LD/DD/DW/WW results)
+-
+
+## Tuning Heartbeats
+
+## All of them
 1. Handle training and match cases
 2. Save games that are uploaded
   - Verify versions before save
@@ -300,7 +323,7 @@ TODO for this function:
 3. Handle SPRT and tuning progress
 4. Correctly update task status based on progress
 5. Remove tasks that are never completed, missing a number of heart beats
-6. Handle cancellation logic
+6. Handle cancellation logic (Stop iff task is finished, find some way to report new networks required)
 7. Handle crashes and logging
 */
 func (s *TaskServiceImpl) ReportProgress(ctx context.Context, req *pb.ProgressReport) (*pb.ProgressResponse, error) {
