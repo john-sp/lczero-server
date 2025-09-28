@@ -34,7 +34,7 @@
 
   <!-- Pagination -->
   <nav aria-label="Network pagination">
-    <ul class="pagination">
+    <ul class="pagination justify-content-center">
       {{if .hasPrev}}
         <li class="page-item">
           {{if .run}}
@@ -73,7 +73,7 @@
     </ul>
   </nav>
 
-  <div class="mt-2">
+  <div class="text-center mt-2">
     <small class="text-muted">Showing {{len .networks}} networks per page out of {{.total}} networks.</small>
   </div>
 </div>
