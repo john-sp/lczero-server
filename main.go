@@ -1606,16 +1606,31 @@ func viewStats(c *gin.Context) {
 
 func viewMatches(c *gin.Context) {
 	var matches []db.Match
+	var total int64
 	var err error
+	
+	// Pagination parameters
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize := 100
+	offset := (page - 1) * pageSize
+
 	run := c.Param("run")
 	run = strings.TrimPrefix(run, "/")
+
+	// Get total count and paginated results for matches
 	if run == "" {
-		err = db.GetDB().Order("id desc").Find(&matches).Error
+		err = db.GetDB().Model(&db.Match{}).Count(&total).Error
+		if err == nil {
+			err = db.GetDB().Order("id desc").Offset(offset).Limit(pageSize).Find(&matches).Error
+		}
 	} else {
-		err = db.GetDB().Order("id desc").Where("training_run_id = ?", run).Find(&matches).Error
-	}
-	if c.DefaultQuery("show_all", "1") == "0" {
-		matches = matches[0:99]
+		err = db.GetDB().Model(&db.Match{}).Where("training_run_id = ?", run).Count(&total).Error
+		if err == nil {
+			err = db.GetDB().Order("id desc").Where("training_run_id = ?", run).Offset(offset).Limit(pageSize).Find(&matches).Error
+		}
 	}
 	if err != nil {
 		log.Println(err)
@@ -1684,8 +1699,21 @@ func viewMatches(c *gin.Context) {
 		})
 	}
 
+	// Calculate pagination info
+	totalPages := int((total + int64(pageSize) - 1) / int64(pageSize))
+	hasPrev := page > 1
+	hasNext := page < totalPages
+
 	c.HTML(http.StatusOK, "matches", gin.H{
-		"matches": json,
+		"matches":    json,
+		"page":       page,
+		"totalPages": totalPages,
+		"total":      total,
+		"hasPrev":    hasPrev,
+		"hasNext":    hasNext,
+		"prevPage":   page - 1,
+		"nextPage":   page + 1,
+		"run":        run,
 	})
 }
 
