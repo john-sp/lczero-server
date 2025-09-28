@@ -39,7 +39,11 @@
     <ul class="pagination">
       {{if .hasPrev}}
         <li class="page-item">
-          <a class="page-link" href="?page={{.prevPage}}{{if .run}}&run={{.run}}{{end}}" aria-label="Previous">
+          {{if .run}}
+            <a class="page-link" href="/matches/{{.run}}?page={{.prevPage}}" aria-label="Previous">
+          {{else}}
+            <a class="page-link" href="/matches?page={{.prevPage}}" aria-label="Previous">
+          {{end}}
             <span aria-hidden="true">&laquo;</span>
           </a>
         </li>
@@ -55,7 +59,11 @@
 
       {{if .hasNext}}
         <li class="page-item">
-          <a class="page-link" href="?page={{.nextPage}}{{if .run}}&run={{.run}}{{end}}" aria-label="Next">
+          {{if .run}}
+            <a class="page-link" href="/matches/{{.run}}?page={{.nextPage}}" aria-label="Next">
+          {{else}}
+            <a class="page-link" href="/matches?page={{.nextPage}}" aria-label="Next">
+          {{end}}
             <span aria-hidden="true">&raquo;</span>
           </a>
         </li>
