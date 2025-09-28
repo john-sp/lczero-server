@@ -1427,13 +1427,31 @@ func getNetworkCounts(networks []db.Network) map[uint]uint64 {
 
 func viewNetworks(c *gin.Context) {
 	var networks []db.Network
+	var total int64
 	var err error
+	
+	// Pagination parameters
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize := 100
+	offset := (page - 1) * pageSize
+
 	run := c.Param("run")
 	run = strings.TrimPrefix(run, "/")
+
+	// Get total count and paginated results
 	if run == "" {
-		err = db.GetDB().Order("id desc").Find(&networks).Error
+		err = db.GetDB().Model(&db.Network{}).Count(&total).Error
+		if err == nil {
+			err = db.GetDB().Order("id desc").Offset(offset).Limit(pageSize).Find(&networks).Error
+		}
 	} else {
-		err = db.GetDB().Order("id desc").Where("training_run_id = ?", run).Find(&networks).Error
+		err = db.GetDB().Model(&db.Network{}).Where("training_run_id = ?", run).Count(&total).Error
+		if err == nil {
+			err = db.GetDB().Order("id desc").Where("training_run_id = ?", run).Offset(offset).Limit(pageSize).Find(&networks).Error
+		}
 	}
 	if err != nil {
 		log.Println(err)
@@ -1459,9 +1477,6 @@ func viewNetworks(c *gin.Context) {
 
 	counts := getNetworkCounts(networks)
 	json := []gin.H{}
-	if c.DefaultQuery("show_all", "1") == "0" {
-		networks = networks[0:99]
-	}
 	for _, network := range networks {
 		json = append(json, gin.H{
 			"id":          network.ID,
@@ -1478,8 +1493,21 @@ func viewNetworks(c *gin.Context) {
 		})
 	}
 
+	// Calculate pagination info
+	totalPages := int((total + int64(pageSize) - 1) / int64(pageSize))
+	hasPrev := page > 1
+	hasNext := page < totalPages
+
 	c.HTML(http.StatusOK, "networks", gin.H{
-		"networks": json,
+		"networks":   json,
+		"page":       page,
+		"totalPages": totalPages,
+		"total":      total,
+		"hasPrev":    hasPrev,
+		"hasNext":    hasNext,
+		"prevPage":   page - 1,
+		"nextPage":   page + 1,
+		"run":        run,
 	})
 }
 
